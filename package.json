@@ -1,15 +1,20 @@
 {
-  "name": "proxy-server",
+  "name": "full-proxy-server",
   "version": "1.0.0",
+  "description": "SPA対応完全プロキシサーバー（Game8など）",
+  "main": "server.js",
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^3.3.2",
+    "node-fetch": "^3.4.1",
     "jsdom": "^22.1.0",
     "ws": "^8.17.0",
     "body-parser": "^1.20.2"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }
