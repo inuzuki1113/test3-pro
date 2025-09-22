@@ -15,26 +15,26 @@ app.use(bodyParser.json());
 // ---- フォームページ ----
 app.get("/", (req, res) => {
   res.send(`
-    <html>
-    <head>
-      <title>完全プロキシ 強化版</title>
-      <style>
-        body{font-family:Arial,sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
-        .container{background:#fff;padding:30px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.15);text-align:center;}
-        input{width:300px;padding:8px;margin-right:10px;}
-        button{padding:8px 12px;}
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <h2>完全プロキシサイト（強化版）</h2>
-        <form method="get" action="/proxy">
-          <input type="text" name="url" placeholder="Enter URL"/>
-          <button>Go</button>
-        </form>
-      </div>
-    </body>
-    </html>
+  <html>
+  <head>
+    <title>完全プロキシ 強化版</title>
+    <style>
+      body{font-family:Arial,sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
+      .container{background:#fff;padding:30px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.15);text-align:center;}
+      input{width:300px;padding:8px;margin-right:10px;}
+      button{padding:8px 12px;}
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h2>完全プロキシサイト（強化版）</h2>
+      <form method="get" action="/proxy">
+        <input type="text" name="url" placeholder="Enter URL"/>
+        <button>Go</button>
+      </form>
+    </div>
+  </body>
+  </html>
   `);
 });
 
@@ -108,14 +108,46 @@ async function proxyRequest(targetUrl, req, res, method="GET", body=null){
         } catch(e){}
       });
 
-      // 広告・トラッキング除去（簡易）
+      // ---- CSS 内 url(...) 書き換え ----
+      [...document.querySelectorAll("link[rel=stylesheet]")].forEach(async link=>{
+        try{
+          const cssRes = await fetch(new URL(link.href, baseUrl).href);
+          let cssText = await cssRes.text();
+          cssText = cssText.replace(/url\((['"]?)(.*?)\1\)/g, (match, quote, url)=>{
+            try{
+              const absUrl = new URL(url, link.href).href;
+              return `url('${'/proxy?url='+encodeURIComponent(absUrl)}')`;
+            }catch(e){ return match; }
+          });
+          const styleEl = document.createElement("style");
+          styleEl.textContent = cssText;
+          link.replaceWith(styleEl);
+        }catch(e){}
+      });
+
+      // ---- JS 内 import 書き換え（module対応） ----
+      [...document.querySelectorAll("script[type=module]")].forEach(async script=>{
+        try{
+          const jsRes = await fetch(new URL(script.src, baseUrl).href);
+          let jsText = await jsRes.text();
+          jsText = jsText.replace(/import\s+(.*?from\s+)?['"](https?:\/\/[^'"]+)['"]/g,
+            (m,p,url)=> p?`${p}'/proxy?url=${encodeURIComponent(url)}'`:`import '/proxy?url=${encodeURIComponent(url)}'`
+          );
+          const newScript = document.createElement("script");
+          newScript.type = "module";
+          newScript.textContent = jsText;
+          script.replaceWith(newScript);
+        }catch(e){}
+      });
+
+      // ---- 広告・トラッキング除去（簡易） ----
       document.querySelectorAll('iframe,script').forEach(el=>{
         if(el.src && (el.src.includes('ads')||el.src.includes('doubleclick'))) el.remove();
       });
 
       // ---- クライアント側 JS フック ----
-      const script = document.createElement("script");
-      script.textContent = `
+      const clientScript = document.createElement("script");
+      clientScript.textContent = `
         (function(){
           const encodeProxy = url=>'/proxy?url='+encodeURIComponent(url);
           // fetch
@@ -126,9 +158,9 @@ async function proxyRequest(targetUrl, req, res, method="GET", body=null){
           XMLHttpRequest.prototype.open=function(m,url){if(url.startsWith('http'))url=encodeProxy(url);return origXHR.apply(this,arguments);}
           // eval/Function
           const origEval=window.eval;
-          window.eval=code=>origEval(code.replace(/(https?:\\/\\/[^\\s'"]+)/g,encodeProxy));
+          window.eval=code=>origEval(code.replace(/(https?:\/\/[^\\s'"]+)/g,encodeProxy));
           const OrigFunction=Function;
-          window.Function=function(...args){const body=args.pop().replace(/(https?:\\/\\/[^\\s'"]+)/g,encodeProxy);return OrigFunction(...args,body);}
+          window.Function=function(...args){const body=args.pop().replace(/(https?:\/\/[^\\s'"]+)/g,encodeProxy);return OrigFunction(...args,body);}
           // setTimeout/setInterval 内文字列
           const origSetTimeout=window.setTimeout;
           window.setTimeout=(fn,t,...args)=>origSetTimeout(typeof fn==='string'?()=>eval(fn):fn,t,...args);
@@ -142,13 +174,38 @@ async function proxyRequest(targetUrl, req, res, method="GET", body=null){
           window.WebSocket=function(url,protocols){if(url.startsWith('ws'))url=url.replace(/^ws(s)?:/,location.protocol==='https:'?'wss:':'ws:');return new OriginalWS(url,protocols);}
         })();
       `;
-      document.body.appendChild(script);
+      document.body.appendChild(clientScript);
 
       res.send(dom.serialize());
       return;
     }
 
-    // ---- HTML 以外はストリーミング ----
+    // ---- CSSの場合 ----
+    if(contentType.includes('text/css')){
+      let css = await response.text();
+      css = css.replace(/url\((['"]?)(.*?)\1\)/g, (match, quote, url)=>{
+        try{
+          const absUrl = new URL(url, targetUrl).href;
+          return `url('${'/proxy?url='+encodeURIComponent(absUrl)}')`;
+        }catch(e){ return match; }
+      });
+      res.setHeader('content-type','text/css');
+      res.send(css);
+      return;
+    }
+
+    // ---- JSの場合 ----
+    if(contentType.includes('javascript')){
+      let js = await response.text();
+      js = js.replace(/import\s+(.*?from\s+)?['"](https?:\/\/[^'"]+)['"]/g,
+        (m,p,url)=> p?`${p}'/proxy?url=${encodeURIComponent(url)}'`:`import '/proxy?url=${encodeURIComponent(url)}'`
+      );
+      res.setHeader('content-type','application/javascript');
+      res.send(js);
+      return;
+    }
+
+    // ---- JSON/画像/動画等はストリーミング ----
     await streamProxy(targetUrl, req, res);
 
   } catch(e){
