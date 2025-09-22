@@ -9,7 +9,6 @@ import { PassThrough } from "stream";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- ミドルウェア ----
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
@@ -17,21 +16,29 @@ app.use(bodyParser.json());
 app.get("/", (req, res) => {
   res.send(`
     <html>
-      <head><title>完全プロキシ 強化版</title></head>
-      <body>
+    <head>
+      <title>完全プロキシ 強化版</title>
+      <style>
+        body{font-family:Arial,sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
+        .container{background:#fff;padding:30px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.15);text-align:center;}
+        input{width:300px;padding:8px;margin-right:10px;}
+        button{padding:8px 12px;}
+      </style>
+    </head>
+    <body>
+      <div class="container">
         <h2>完全プロキシサイト（強化版）</h2>
         <form method="get" action="/proxy">
-          <input type="text" name="url" placeholder="Enter URL" style="width:400px"/>
+          <input type="text" name="url" placeholder="Enter URL"/>
           <button>Go</button>
         </form>
-        <button onclick="window.history.back()">戻る</button>
-        <button onclick="location.reload()">リロード</button>
-      </body>
+      </div>
+    </body>
     </html>
   `);
 });
 
-// ---- ストリーミング対応プロキシ ----
+// ---- ストリーミング対応 ----
 async function streamProxy(targetUrl, req, res){
   const headers = {};
   if(req.headers.range) headers['range'] = req.headers.range;
@@ -55,112 +62,84 @@ async function streamProxy(targetUrl, req, res){
   pass.pipe(res);
 }
 
-// ---- GET/POST 共通プロキシ処理 ----
+// ---- プロキシ処理 ----
 async function proxyRequest(targetUrl, req, res, method="GET", body=null){
   if(!targetUrl) return res.send("URLを入力してください");
 
-  // HTML / 非HTML 判断
   try {
     const headers = {};
     if(req.headers.range) headers['range'] = req.headers.range;
     if(req.headers['accept-encoding']) headers['accept-encoding'] = req.headers['accept-encoding'];
 
     const fetchOptions = { method, headers };
-    if(body) {
-      if(method==="POST"){
-        fetchOptions.body = new URLSearchParams(body);
-      } else {
-        fetchOptions.body = body;
-      }
+    if(body){
+      if(method==="POST") fetchOptions.body = new URLSearchParams(body);
+      else fetchOptions.body = body;
     }
 
     const response = await fetch(targetUrl, fetchOptions);
     const contentType = response.headers.get("content-type") || "";
 
-    // Cookie中継
-    if(response.headers.has("set-cookie")){
-      res.setHeader("set-cookie", response.headers.get("set-cookie"));
-    }
+    if(response.headers.has("set-cookie")) res.setHeader("set-cookie", response.headers.get("set-cookie"));
+    if(response.status===206) res.status(206);
 
-    // 206 Partial Content 対応
-    if(response.status === 206) res.status(206);
-
-    // ---- HTML の場合 ----
+    // ---- HTMLの場合 ----
     if(contentType.includes("text/html")){
       let html = await response.text();
       const dom = new JSDOM(html);
       const document = dom.window.document;
 
-      // 広告・トラッキング除去
-      document.querySelectorAll('iframe, script').forEach(el=>{
-        if(el.src && (el.src.includes('ads') || el.src.includes('doubleclick'))){
-          el.remove();
-        }
+      // <base> タグで相対パス解決
+      const base = document.createElement("base");
+      base.href = targetUrl;
+      document.head.prepend(base);
+
+      const baseUrl = new URL(targetUrl);
+
+      // リンク・フォーム・画像・動画・スクリプトを書き換え（相対パス補完）
+      [...document.querySelectorAll("a,link,form,script,img,iframe,video,audio")].forEach(el => {
+        const attr = el.href ? "href" : el.src ? "src" : null;
+        if(!attr) return;
+        try {
+          let url = new URL(el[attr], baseUrl).href;
+          // 外部 CDN は書き換え除外
+          if(url.includes("google.com") || url.includes("cdnjs.cloudflare.com")) return;
+          el[attr] = "/proxy?url=" + encodeURIComponent(url);
+        } catch(e){}
       });
 
-      // リンク・フォーム・画像・動画・スクリプト書き換え
-      [...document.querySelectorAll("a,link,form,script,img,iframe,video,audio")].forEach(el=>{
-        if(el.tagName==="FORM") el.action="/proxy?url="+encodeURIComponent(el.action||targetUrl);
-        else if(el.href) el.href="/proxy?url="+encodeURIComponent(el.href);
-        else if(el.src) el.src="/proxy?url="+encodeURIComponent(el.src);
+      // 広告・トラッキング除去（簡易）
+      document.querySelectorAll('iframe,script').forEach(el=>{
+        if(el.src && (el.src.includes('ads')||el.src.includes('doubleclick'))) el.remove();
       });
 
       // ---- クライアント側 JS フック ----
       const script = document.createElement("script");
       script.textContent = `
         (function(){
-          const encodeProxy = url => '/proxy?url=' + encodeURIComponent(url);
-
+          const encodeProxy = url=>'/proxy?url='+encodeURIComponent(url);
           // fetch
-          const origFetch = window.fetch;
-          window.fetch = function(input, init){
-            if(typeof input==='string' && input.startsWith('http')) input=encodeProxy(input);
-            return origFetch(input, init);
-          };
-
+          const origFetch=window.fetch;
+          window.fetch=function(input,init){if(typeof input==='string'&&input.startsWith('http'))input=encodeProxy(input);return origFetch(input,init);}
           // XHR
-          const origXHR = XMLHttpRequest.prototype.open;
-          XMLHttpRequest.prototype.open = function(method,url){
-            if(url.startsWith('http')) url=encodeProxy(url);
-            return origXHR.apply(this, arguments);
-          };
-
-          // eval & Function
-          const origEval = window.eval;
-          window.eval = code => origEval(code.replace(/(https?:\\/\\/[^\\s'"]+)/g, encodeProxy));
-          const OrigFunction = Function;
-          window.Function = function(...args){
-            const body = args.pop().replace(/(https?:\\/\\/[^\\s'"]+)/g, encodeProxy);
-            return OrigFunction(...args, body);
-          };
-
+          const origXHR=XMLHttpRequest.prototype.open;
+          XMLHttpRequest.prototype.open=function(m,url){if(url.startsWith('http'))url=encodeProxy(url);return origXHR.apply(this,arguments);}
+          // eval/Function
+          const origEval=window.eval;
+          window.eval=code=>origEval(code.replace(/(https?:\\/\\/[^\\s'"]+)/g,encodeProxy));
+          const OrigFunction=Function;
+          window.Function=function(...args){const body=args.pop().replace(/(https?:\\/\\/[^\\s'"]+)/g,encodeProxy);return OrigFunction(...args,body);}
           // setTimeout/setInterval 内文字列
-          const origSetTimeout = window.setTimeout;
-          window.setTimeout = (fn,t,...args) => origSetTimeout(typeof fn==='string'?()=>eval(fn):fn,t,...args);
-          const origSetInterval = window.setInterval;
-          window.setInterval = (fn,t,...args) => origSetInterval(typeof fn==='string'?()=>eval(fn):fn,t,...args);
-
-          // 動的 script/img/iframe 書き換え
-          const origCreate = document.createElement.bind(document);
-          document.createElement = function(tag){
-            const el = origCreate(tag);
-            if(['script','iframe','img'].includes(tag.toLowerCase())){
-              const origSetAttr = el.setAttribute.bind(el);
-              el.setAttribute = (attr,val)=>{
-                if((attr==='src'||attr==='href') && val.startsWith('http')) val=encodeProxy(val);
-                return origSetAttr(attr,val);
-              };
-            }
-            return el;
-          };
-
-          // WebSocket プロキシ（簡易版）
-          const OriginalWS = window.WebSocket;
-          window.WebSocket = function(url,protocols){
-            if(url.startsWith('ws')) url = url.replace(/^ws(s)?:/, location.protocol==='https:'?'wss:':'ws:');
-            return new OriginalWS(url,protocols);
-          };
-
+          const origSetTimeout=window.setTimeout;
+          window.setTimeout=(fn,t,...args)=>origSetTimeout(typeof fn==='string'?()=>eval(fn):fn,t,...args);
+          const origSetInterval=window.setInterval;
+          window.setInterval=(fn,t,...args)=>origSetInterval(typeof fn==='string'?()=>eval(fn):fn,t,...args);
+          // createElement 書き換え
+          const origCreate=document.createElement.bind(document);
+          document.createElement=function(tag){const el=origCreate(tag);if(['script','iframe','img'].includes(tag.toLowerCase())){const origSetAttr=el.setAttribute.bind(el);el.setAttribute=(a,v)=>{if((a==='src'||a==='href')&&v.startsWith('http'))v=encodeProxy(v);return origSetAttr(a,v);}};return el;}
+          // WebSocket
+          const OriginalWS=window.WebSocket;
+          window.WebSocket=function(url,protocols){if(url.startsWith('ws'))url=url.replace(/^ws(s)?:/,location.protocol==='https:'?'wss:':'ws:');return new OriginalWS(url,protocols);}
         })();
       `;
       document.body.appendChild(script);
@@ -169,7 +148,7 @@ async function proxyRequest(targetUrl, req, res, method="GET", body=null){
       return;
     }
 
-    // ---- HTML 以外はストリーミング中継 ----
+    // ---- HTML 以外はストリーミング ----
     await streamProxy(targetUrl, req, res);
 
   } catch(e){
@@ -189,13 +168,12 @@ app.post("/proxy", async (req,res)=> {
   await proxyRequest(url, req, res, "POST", req.body);
 });
 
-// ---- WebSocket サーバー 完全中継 ----
+// ---- WebSocket 完全中継 ----
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 wss.on("connection", clientWS => {
   console.log("WebSocket connected");
-
   clientWS.on("message", async msg => {
     try{
       const data = JSON.parse(msg);
@@ -205,11 +183,7 @@ wss.on("connection", clientWS => {
         targetWS.on("message", m=> clientWS.send(JSON.stringify({type:'message',msg:m.toString()})));
         targetWS.on("close", ()=> clientWS.send(JSON.stringify({type:'status',msg:'closed'})));
         targetWS.on("error", e=> clientWS.send(JSON.stringify({type:'error',msg:e.message})));
-
-        clientWS.on("message", msg2=>{
-          const d = JSON.parse(msg2);
-          if(d.type==='send') targetWS.send(d.payload);
-        });
+        clientWS.on("message", msg2=>{const d=JSON.parse(msg2);if(d.type==='send') targetWS.send(d.payload);});
       }
     }catch(e){ console.error(e) }
   });
